@@ -46191,7 +46191,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"solidity-ast@npm:^0.4.15":
+"solidity-ast@npm:^0.4.45":
   version: 0.4.45
   resolution: "solidity-ast@npm:0.4.45"
   checksum: a9d2908f8335c09b7c943c912281679236f43be0b4a679ac9310c55a36c189249a4cf26f90e26a694e3c5b7db5bdf1c3b72e367597c3e4a46bbca4973601b1d4
