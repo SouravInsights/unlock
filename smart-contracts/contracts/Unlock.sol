@@ -29,14 +29,27 @@ pragma solidity ^0.8.7;
 
 import "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 import "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
-import "hardlydifficult-eth/contracts/protocols/Uniswap/IUniswapOracle.sol";
 import '@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol';
 import '@uniswap/v3-periphery/contracts/libraries/TransferHelper.sol';
 import "./utils/UnlockOwnable.sol";
 import "./utils/UnlockInitializable.sol";
+import "./interfaces//IUniswapOracleV3.sol";
 import "./interfaces/IPublicLock.sol";
 import "./interfaces/IMintableERC20.sol";
-import "./interfaces/IPermit2.sol";
+
+error Unlock__MANAGER_ONLY();   
+error Unlock__VERSION_TOO_HIGH();   
+error Unlock__MISSING_TEMPLATE();  
+error Unlock__ALREADY_DEPLOYED();
+error Unlock__MISSING_PROXY_ADMIN();
+error Unlock__MISSING_LOCK_TEMPLATE();
+
+// TODO: prefix errors
+error SwapFailed(address uniswapRouter, address tokenIn, address tokenOut, uint amountInMax, bytes callData);
+error LockDoesntExist(address lockAddress);
+error InsufficientBalance();
+error UnauthorizedBalanceChange();
+error LockCallFailed();
 
 /// @dev Must list the direct base contracts in the order from “most base-like” to “most derived”.
 /// https://solidity.readthedocs.io/en/latest/contracts.html#multiple-inheritance-and-linearization
@@ -78,7 +91,7 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
 
   // Map token address to oracle contract address if the token is supported
   // Used for GDP calculations
-  mapping(address => IUniswapOracle) public uniswapOracles;
+  mapping(address => IUniswapOracleV3) public uniswapOracles;
 
   // The WETH token address, used for value calculations
   address public weth;
@@ -100,9 +113,6 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
   mapping(address => uint16) private _publicLockVersions;
   mapping(uint16 => address) private _publicLockImpls;
   uint16 public publicLockLatestVersion;
-
-  // required by Uniswap Universal Router
-  address public permit2;
 
   // Events
   event NewLock(
@@ -141,19 +151,6 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
     uint16 indexed version
   );
 
-  event SwapCall(
-    address lock,
-    address tokenAddress,
-    uint amountSpent
-  );
-
-  // errors
-  error SwapFailed(address uniswapRouter, address tokenIn, address tokenOut, uint amountInMax, bytes callData);
-  error LockDoesntExist(address lockAddress);
-  error InsufficientBalance();
-  error UnauthorizedBalanceChange();
-  error LockCallFailed();
-
   // Use initialize instead of a constructor to support proxies (for upgradeability via OZ).
   function initialize(
     address _unlockOwner
@@ -163,12 +160,8 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
     // add a proxy admin on deployment
     _deployProxyAdmin();
   }
-
   function initializeProxyAdmin() public onlyOwner {
-    require(
-      proxyAdminAddress == address(0),
-      "ALREADY_DEPLOYED"
-    );
+    if(proxyAdminAddress != address(0)){revert Unlock__ALREADY_DEPLOYED();}
     _deployProxyAdmin();
   }
 
@@ -287,17 +280,15 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
     bytes memory data,
     uint16 _lockVersion
   ) public returns (address) {
-    require(
-      proxyAdminAddress != address(0),
-      "MISSING_PROXY_ADMIN"
-    );
+    if(proxyAdminAddress == address(0)){
+      revert Unlock__MISSING_PROXY_ADMIN();
+    }
 
     // get lock version
     address publicLockImpl = _publicLockImpls[_lockVersion];
-    require(
-      publicLockImpl != address(0),
-      "MISSING_LOCK_TEMPLATE"
-    );
+    if(publicLockImpl == address(0)){
+      revert Unlock__MISSING_LOCK_TEMPLATE();
+    }
 
     // deploy a proxy pointing to impl
     TransparentUpgradeableProxy proxy = new TransparentUpgradeableProxy(
@@ -324,32 +315,28 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
    * @param lockAddress the address of the lock to be upgraded
    * @param version the version number of the template
    */
-  function upgradeLock(
-    address payable lockAddress,
-    uint16 version
-  ) external returns (address) {
-    require(
-      proxyAdminAddress != address(0),
-      "MISSING_PROXY_ADMIN"
-    );
+
+  function upgradeLock(address payable lockAddress, uint16 version) external returns(address) {
+    if(proxyAdminAddress == address(0)){
+      revert Unlock__MISSING_PROXY_ADMIN();
+    }
 
     // check perms
-    require(
-      _isLockManager(lockAddress, msg.sender) == true,
-      "MANAGER_ONLY"
-    );
+    if(_isLockManager(lockAddress, msg.sender) != true){
+      revert Unlock__MANAGER_ONLY();
+    }
 
     // check version
     IPublicLock lock = IPublicLock(lockAddress);
     uint16 currentVersion = lock.publicLockVersion();
-    require(
-      version == currentVersion + 1,
-      "VERSION_TOO_HIGH"
-    );
+
+    if(version != currentVersion + 1){
+      revert Unlock__VERSION_TOO_HIGH();
+    }
 
     // make our upgrade
     address impl = _publicLockImpls[version];
-    require(impl != address(0), "MISSING_TEMPLATE");
+    if(impl == address(0)){revert Unlock__MISSING_TEMPLATE();}
 
     TransparentUpgradeableProxy proxy = TransparentUpgradeableProxy(
         lockAddress
@@ -412,7 +399,7 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
         tokenAddress != address(0) && tokenAddress != weth
       ) {
         // If priced in an ERC-20 token, find the supported uniswap oracle
-        IUniswapOracle oracle = uniswapOracles[
+        IUniswapOracleV3 oracle = uniswapOracles[
           tokenAddress
         ];
         if (address(oracle) != address(0)) {
@@ -439,7 +426,7 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
 
       // Distribute UDT
       if (_referrer != address(0)) {
-        IUniswapOracle udtOracle = uniswapOracles[udt];
+        IUniswapOracleV3 udtOracle = uniswapOracles[udt];
         if (address(udtOracle) != address(0)) {
           // Get the value of 1 UDT (w/ 18 decimals) in ETH
           uint udtPrice = udtOracle.updateAndConsult(
@@ -505,122 +492,6 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
         }
       }
     }
-  }
-
-  function getBalance(address token) internal view returns (uint) {
-    return token == address(0) ?
-      address(this).balance 
-      :
-      IMintableERC20(token).balanceOf(address(this));
-  }
-
-  // set permit2 address
-  function setPermit2(address _permit2) public onlyOwner {
-     permit2 = _permit2;
-  }
-
-  /**
-   * Please refer to IUnlock.sol for documentation
-   */
-  function swapAndCall(
-    address lock,
-    address srcToken,
-    uint amountInMax,
-    address swapRouter,
-    bytes memory swapCalldata,
-    bytes memory callData
-  ) public payable returns(bytes memory) {
-    // check if lock exists
-    if(!locks[lock].deployed) {
-      revert LockDoesntExist(lock);
-    }
-
-    // get lock pricing 
-    address destToken = IPublicLock(lock).tokenAddress();
-
-    // get price in destToken from lock
-    uint keyPrice = IPublicLock(lock).keyPrice();
-
-    // get balances of Unlock before
-    // if payments in ETH, substract the value sent by user to get actual balance
-    uint balanceTokenDestBefore = destToken == address(0) ? 
-      getBalance(destToken) - msg.value 
-            :
-      getBalance(destToken);
-
-    uint balanceTokenSrcBefore = 
-        srcToken == address(0) ? 
-          getBalance(srcToken) - msg.value 
-          :
-          getBalance(srcToken);
-
-    if(srcToken != address(0)) {
-      // Transfer the specified amount of src ERC20 to this contract
-      TransferHelper.safeTransferFrom(srcToken, msg.sender, address(this), amountInMax);
-
-      // Approve the router to spend src ERC20
-      TransferHelper.safeApprove(srcToken, swapRouter, amountInMax);
-
-      // approve PERMIT2 to manipulate the token
-      IERC20(srcToken).approve(permit2, amountInMax);
-    }
-
-    // issue PERMIT2 Allowance
-    IPermit2(permit2).approve(
-      srcToken,
-      swapRouter,
-      uint160(amountInMax),
-      uint48(block.timestamp + 60) // expires after 1min
-    );
-
-    // executes the swap
-    (bool success, ) = swapRouter.call{ 
-      value: srcToken == address(0) ? msg.value : 0 
-    }(swapCalldata);
-
-    // make sure to catch Uniswap revert
-    if(success == false) {
-      revert SwapFailed(swapRouter, srcToken, destToken, amountInMax, swapCalldata);
-    }
-
-    // make sure balance is enough to buy key
-    if((
-      destToken == address(0) ? 
-      getBalance(destToken) - msg.value 
-            :
-      getBalance(destToken)
-    ) < balanceTokenDestBefore + keyPrice) {
-      revert InsufficientBalance();
-    }
-
-    // approve ERC20 to call the lock
-    if(destToken != address(0)) {
-      IMintableERC20(destToken).approve(lock, keyPrice);
-    }
-
-    // call the lock
-    (bool lockCallSuccess, bytes memory returnData) = lock.call{
-      value: destToken == address(0) ? keyPrice : 0
-    }(
-      callData
-    );
-
-    if(lockCallSuccess == false) {
-      revert LockCallFailed();
-    }
-
-    // check that Unlock didnt spent more than it received
-    if(
-      getBalance(srcToken) - balanceTokenSrcBefore < 0
-      ||
-      getBalance(destToken) - balanceTokenDestBefore < 0
-    ) {
-      // balance too low
-      revert UnauthorizedBalanceChange();
-    }
-
-    // returns whatever the lock returned
-    return returnData;
   }
 
   /**
@@ -724,11 +595,11 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
     address _tokenAddress,
     address _oracleAddress
   ) external onlyOwner {
-    uniswapOracles[_tokenAddress] = IUniswapOracle(
+    uniswapOracles[_tokenAddress] = IUniswapOracleV3(
       _oracleAddress
     );
     if (_oracleAddress != address(0)) {
-      IUniswapOracle(_oracleAddress).update(
+      IUniswapOracleV3(_oracleAddress).update(
         _tokenAddress,
         weth
       );
@@ -771,6 +642,6 @@ contract Unlock is UnlockInitializable, UnlockOwnable {
     return globalTokenSymbol;
   }
 
-  // required to withdraw WETH
+  // required to receive ETH
   receive() external payable {}
 }
